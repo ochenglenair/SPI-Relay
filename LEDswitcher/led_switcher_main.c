@@ -1,7 +1,8 @@
 /**
  * \file
  *
- * \brief Application to control an Infineon ISO1H816G evaluation board via SPI.
+ * \brief Application to control an Infineon ISO1H816G evaluation board via SPI
+ * using commands from a serial terminal.
  *
  * Copyright (c) 2015-2018 Microchip Technology Inc. and its subsidiaries.
  *
@@ -35,25 +36,21 @@
  */
 
 #include "atmel_start.h"
-#include "atmel_start_pins.h" 
+#include "atmel_start_pins.h"
 #include <hal_gpio.h>
 #include <hal_delay.h>
 #include <hal_spi_m_sync.h>
+#include <hal_usart_sync.h> // Include for serial communication
+#include <string.h>          // Include for string functions
+#include <stdio.h>           // Include for sprintf
 
 // --- Pin Definitions for Infineon Board Control ---
-// **IMPORTANT**: These pin assignments must match your MCC configuration.
-//
-// SPI Peripheral Pins (handled by MCC SERCOM configuration):
-// MOSI: PA04 (Maps to K3 Pin 6 - SI)
-// MISO: PA06 (Maps to K3 Pin 13 - SO)
-// SCK:  PA05 (Maps to K3 Pin 4 - SCLK)
-//
-// GPIO Control Pins (handled by this code):
-#define CS_PIN   PA07 // Chip Select (Maps to K3 Pin 3 - /CS) <-- UPDATED PIN
-#define DIS_PIN  PA02 // Disable Pin (Maps to K3 Pin 2 - /DIS)
+#define CS_PIN   PA07
+#define DIS_PIN  PA02
 
-// SPI peripheral instance from atmel_start
+// Peripheral instances from atmel_start
 extern struct spi_m_sync_descriptor SPI_0;
+extern struct usart_sync_descriptor USART_0; // USART for serial terminal
 
 /**
  * @brief Sends commands to both daisy-chained ISO1H816G chips.
@@ -62,82 +59,95 @@ extern struct spi_m_sync_descriptor SPI_0;
  */
 void send_iso_command(uint8_t command_k2, uint8_t command_k1)
 {
-    // Create a 2-byte buffer for the SPI transfer.
-    // Due to the daisy-chain, the command for the last chip (K2) must be sent first.
     uint8_t commands[2] = {command_k2, command_k1};
-
     struct spi_xfer xfer;
     xfer.txbuf = commands;
     xfer.rxbuf = NULL;
-    xfer.size  = 2; // Transfer two bytes
+    xfer.size  = 2;
 
-    // 1. Assert Chip Select (pull it LOW to select the chips)
     gpio_set_pin_level(CS_PIN, false);
-    delay_us(1); // Small delay after CS goes low
-
-    // 2. Perform the 16-bit (2-byte) SPI transfer
+    delay_us(1);
     spi_m_sync_transfer(&SPI_0, &xfer);
-
-    // 3. De-assert Chip Select (pull it HIGH to de-select the chips)
-    // This latches the data into both chips' output registers simultaneously.
-    delay_us(1); // Small delay before CS goes high
+    delay_us(1);
     gpio_set_pin_level(CS_PIN, true);
 }
 
+/**
+ * @brief Parses an 8-character string of '0's and '1's into a byte.
+ * @param buffer The character buffer containing the binary string.
+ * @return The parsed 8-bit integer value. Returns 0 on error.
+ */
+uint8_t parse_binary_string(const char *buffer)
+{
+    uint8_t result = 0;
+    for (int i = 0; i < 8; i++) {
+        if (buffer[i] == '1') {
+            result |= (1 << (7 - i));
+        } else if (buffer[i] != '0') {
+            return 0; // Invalid character
+        }
+    }
+    return result;
+}
+
+/**
+ * @brief Reads a line of exactly n characters from the serial terminal.
+ * @param buffer A pointer to the character buffer to store the input.
+ * @param len The number of characters to read.
+ */
+void read_n_bytes(char* buffer, int len) {
+    int count = 0;
+    while (count < len) {
+        // Read one character at a time
+        if (io_read(&USART_0.io, (uint8_t*)&buffer[count], 1) == 1) {
+            count++;
+        }
+    }
+}
 
 int main(void)
 {
-	uint8_t k1_output_state = 0x00; // State for K1 outputs
-	uint8_t k2_output_state = 0x00; // State for K2 outputs
-	bool toggle = false;
+	char k1_buffer[9] = {0}; // 8 chars + null terminator
+	char k2_buffer[9] = {0};
+	uint8_t k1_state = 0x00;
+	uint8_t k2_state = 0x00;
 
 	atmel_start_init();
 
 	// --- Initialize Control Pins for Infineon Board ---
 	gpio_set_pin_direction(CS_PIN, GPIO_DIRECTION_OUT);
-	gpio_set_pin_level(CS_PIN, true); // Chip select is active low, so initialize it to HIGH (inactive)
-
+	gpio_set_pin_level(CS_PIN, true);
 	gpio_set_pin_direction(DIS_PIN, GPIO_DIRECTION_OUT);
-	gpio_set_pin_level(DIS_PIN, true); // Disable pin is active low, initialize to HIGH (outputs enabled)
+	gpio_set_pin_level(DIS_PIN, true);
 
-	// --- Initialize SPI peripheral ---
+	// --- Initialize Peripherals ---
 	spi_m_sync_enable(&SPI_0);
+	usart_sync_enable(&USART_0);
 
-	// Configure the switch pin with an internal pull-up resistor.
-	gpio_set_pin_pull_mode(SW0, GPIO_PULL_UP);
-
-	// Initial state: Turn all channels off on both chips and turn the onboard LED off.
-	// Note: LED0 on the Xplained Pro is active-low, so true means OFF.
-	gpio_set_pin_level(LED0, true);
+	// Initial state: Turn all channels off
 	send_iso_command(0x00, 0x00);
+	
+	// Send a ready message to the Python script
+	io_write(&USART_0.io, (uint8_t*)"SAMD21 Ready\r\n", 15);
 
 	while (true) {
-		// Wait for the button to be pressed (pin goes LOW)
-		while (gpio_get_pin_level(SW0)) {
-			// Do nothing, just wait for the press.
-		}
+		// Wait for and read the 8 bytes for K1
+		read_n_bytes(k1_buffer, 8);
+		k1_state = parse_binary_string(k1_buffer);
 
-		// Toggle the state for the output channels
-		toggle = !toggle;
-		// Set the same state for both K1 and K2 outputs
-		k1_output_state = toggle ? 0xFF : 0x00; // 0xFF = all ON, 0x00 = all OFF
-		k2_output_state = toggle ? 0xFF : 0x00;
-
-		// Toggle the onboard LED for visual feedback at the same time.
-		gpio_toggle_pin_level(LED0);
+		// Wait for and read the 8 bytes for K2
+		read_n_bytes(k2_buffer, 8);
+		k2_state = parse_binary_string(k2_buffer);
 
 		// Send the new commands to the Infineon board
-		send_iso_command(k2_output_state, k1_output_state);
+		send_iso_command(k2_state, k1_state);
 
-		// Debounce delay for press
-		delay_ms(50);
-
-		// Wait for the button to be released (pin goes back to HIGH)
-		while (!gpio_get_pin_level(SW0)) {
-			// Do nothing, just wait for the release.
-		}
-
-		// Debounce delay for release
-		delay_ms(50);
+		// Send a confirmation message back to the Python script
+		char confirmation_msg[50];
+		sprintf(confirmation_msg, "OK: K1=0x%02X, K2=0x%02X\r\n", k1_state, k2_state);
+		io_write(&USART_0.io, (uint8_t*)confirmation_msg, strlen(confirmation_msg));
+		
+		// Toggle the onboard LED to show a command was processed
+		gpio_toggle_pin_level(LED0);
 	}
 }

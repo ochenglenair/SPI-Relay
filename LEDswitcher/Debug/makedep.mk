@@ -26,6 +26,8 @@ hal\src\hal_sleep.c
 
 hal\src\hal_spi_m_sync.c
 
+hal\src\hal_usart_sync.c
+
 hal\utils\src\utils_assert.c
 
 hal\utils\src\utils_event.c
